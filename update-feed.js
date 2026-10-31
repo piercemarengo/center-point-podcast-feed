@@ -7,6 +7,7 @@ const path = require('path');
 
 const RSS_URL = 'https://anchor.fm/s/d73b7234/podcast/rss';
 const OUT = path.join(__dirname, 'episodes.json');
+const APPLE_SHOW_ID = '6817450378';
 const MONTHS = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
 
 function decode(text) {
@@ -76,9 +77,101 @@ function episode(item) {
     publishedDate: publishedDate,
     duration: duration(field(item, 'itunes:duration')),
     notes: notes,
-    spotifyUrl: field(item, 'link'),
-    audioUrl: audio ? decode(audio[1]) : ''
+    // Filled in by addListenLinks below. The feed's own link goes to Spotify for Creators, not the Spotify app.
+    spotifyUrl: '',
+    appleUrl: '',
+    audioUrl: audio ? decode(audio[1]) : '',
+    _creatorsUrl: field(item, 'link')
   };
+}
+
+const SPOTIFY_EPISODE = /^https:\/\/open\.spotify\.com\/episode\/[A-Za-z0-9]+$/;
+const APPLE_EPISODE = /^https:\/\/podcasts\.apple\.com\/.*[?&]i=\d+/;
+
+// The short code at the end of a Spotify for Creators episode link, like "e3q62mg".
+function creatorsCode(url) {
+  const m = /-(e[a-z0-9]+)\/?$/.exec(url || '');
+  return m ? m[1] : '';
+}
+
+async function getText(url) {
+  const res = await fetch(url, { headers: { 'User-Agent': 'Mozilla/5.0 (center-point-podcast-feed)' } });
+  if (!res.ok) throw new Error(url + ' answered ' + res.status);
+  return res.text();
+}
+
+// Each Spotify for Creators episode page lists that episode and a few others, each with its open.spotify.com link.
+function spotifyLinksIn(page) {
+  const found = {};
+  page.split('"episodeId":"').slice(1).forEach(function (chunk) {
+    const code = /^(e[a-z0-9]+)"/.exec(chunk);
+    const url = /"spotifyUrl":"([^"]+)"/.exec(chunk);
+    if (!code || !url) return;
+    const clean = url[1].replace(/\\u002F/gi, '/');
+    if (SPOTIFY_EPISODE.test(clean)) found[code[1]] = clean;
+  });
+  return found;
+}
+
+// Gives each episode its own Spotify and Apple Podcasts link. Links found on earlier runs are kept, so only new
+// episodes are looked up. An episode that can't be matched keeps an empty link, and the page uses the show's link.
+async function addListenLinks(episodes, old) {
+  const before = {};
+  (old ? old.episodes : []).forEach(function (e) { before[e.id] = e; });
+  episodes.forEach(function (e) {
+    const prev = before[e.id] || {};
+    if (SPOTIFY_EPISODE.test(prev.spotifyUrl || '')) e.spotifyUrl = prev.spotifyUrl;
+    if (APPLE_EPISODE.test(prev.appleUrl || '')) e.appleUrl = prev.appleUrl;
+  });
+
+  // Apple: one lookup covers the latest 200 episodes, matched on the feed's guid.
+  if (episodes.some(function (e) { return !e.appleUrl; })) {
+    try {
+      const data = JSON.parse(await getText('https://itunes.apple.com/lookup?id=' + APPLE_SHOW_ID + '&entity=podcastEpisode&limit=300'));
+      const byGuid = {};
+      data.results.forEach(function (r) { if (r.episodeGuid && r.trackViewUrl) byGuid[r.episodeGuid] = r.trackViewUrl.replace(/[?&]uo=\d+/, ''); });
+      episodes.forEach(function (e) { if (!e.appleUrl && APPLE_EPISODE.test(byGuid[e.id] || '')) e.appleUrl = byGuid[e.id]; });
+    } catch (err) {
+      console.warn('Apple Podcasts lookup failed, keeping the links already known: ' + err.message);
+    }
+  }
+
+  // Older episodes fall outside that lookup, so each one still missing is searched for by title, then matched on guid.
+  // Once found, a link is kept, so this only runs for an episode the first time.
+  for (const e of episodes) {
+    if (e.appleUrl) continue;
+    try {
+      const query = new URLSearchParams({ term: e.title, media: 'podcast', entity: 'podcastEpisode', limit: '50' });
+      const data = JSON.parse(await getText('https://itunes.apple.com/search?' + query));
+      const hit = data.results.filter(function (r) { return String(r.collectionId) === APPLE_SHOW_ID && r.episodeGuid === e.id; })[0];
+      const url = hit && hit.trackViewUrl ? hit.trackViewUrl.replace(/[?&]uo=\d+/, '') : '';
+      if (APPLE_EPISODE.test(url)) e.appleUrl = url;
+    } catch (err) {
+      console.warn('Apple Podcasts search failed for "' + e.title + '": ' + err.message);
+    }
+    // Apple's search allows roughly 20 requests a minute.
+    await new Promise(function (resolve) { setTimeout(resolve, 3000); });
+  }
+
+  // Spotify: open the Creators page of each episode still missing a link (each page also fills in a few neighbours).
+  const spotify = {};
+  for (const e of episodes) {
+    const code = creatorsCode(e._creatorsUrl);
+    if (e.spotifyUrl || !code) continue;
+    if (!spotify[code]) {
+      try {
+        Object.assign(spotify, spotifyLinksIn(await getText(e._creatorsUrl)));
+      } catch (err) {
+        console.warn('Spotify lookup failed for "' + e.title + '": ' + err.message);
+      }
+      await new Promise(function (resolve) { setTimeout(resolve, 250); });
+    }
+    if (spotify[code]) e.spotifyUrl = spotify[code];
+  }
+
+  episodes.forEach(function (e) { delete e._creatorsUrl; });
+  const missing = function (key) { return episodes.filter(function (e) { return !e[key]; }).length; };
+  console.log('Episode links: ' + missing('spotifyUrl') + ' without Spotify, ' + missing('appleUrl') + ' without Apple Podcasts (those use the show page).');
 }
 
 async function main() {
@@ -96,6 +189,8 @@ async function main() {
   if (old && episodes.length < old.episodes.length * 0.9) {
     throw new Error('The feed has ' + episodes.length + ' episodes but episodes.json has ' + old.episodes.length + '; not replacing it');
   }
+
+  await addListenLinks(episodes, old);
 
   if (old && JSON.stringify(old.episodes) === JSON.stringify(episodes)) {
     console.log('episodes.json already matches the RSS feed (' + episodes.length + ' episodes). Nothing to update.');
