@@ -174,11 +174,49 @@ async function addListenLinks(episodes, old) {
   console.log('Episode links: ' + missing('spotifyUrl') + ' without Spotify, ' + missing('appleUrl') + ' without Apple Podcasts (those use the show page).');
 }
 
+// Episode numbers that really are used twice in the feed. Any other repeat is reported as a problem.
+const KNOWN_DUPLICATES = [28];
+
+function duplicateNumbers(episodes) {
+  const seen = {};
+  const repeats = [];
+  episodes.forEach(function (e) {
+    if (e.episodeNumber == null) return;
+    if (seen[e.episodeNumber] && repeats.indexOf(e.episodeNumber) === -1 && KNOWN_DUPLICATES.indexOf(e.episodeNumber) === -1) repeats.push(e.episodeNumber);
+    seen[e.episodeNumber] = true;
+  });
+  return repeats;
+}
+
+function wait(ms) { return new Promise(function (resolve) { setTimeout(resolve, ms); }); }
+
+// The feed is served through a network of servers that each keep their own copy. For a while after an edit in
+// Spotify, some still hand out an older or half-updated copy, and adding anything to the address does not get
+// around that. So the feed is fetched a few times, and the copy built most recently is used. A copy where two
+// episodes share a number is taken as half-updated: the job keeps trying for a little longer before settling.
+async function fetchFeed() {
+  let best = null;
+  for (let attempt = 1; attempt <= 8; attempt++) {
+    if (attempt > 1) await wait(10000);
+    const res = await fetch(RSS_URL, { headers: { 'Cache-Control': 'no-cache' } });
+    if (!res.ok) { console.log('Try ' + attempt + ': the RSS feed answered ' + res.status); continue; }
+    const xml = await res.text();
+    const built = new Date(field(xml, 'lastBuildDate'));
+    const episodes = (xml.match(/<item>[\s\S]*?<\/item>/g) || []).map(episode);
+    const repeats = duplicateNumbers(episodes);
+    console.log('Try ' + attempt + ': ' + episodes.length + ' episodes, feed built ' + (isNaN(built) ? 'at an unknown time' : built.toISOString()) +
+      ', served by ' + (res.headers.get('x-served-by') || 'unknown') + (repeats.length ? ', episode numbers used twice: ' + repeats.join(', ') : ''));
+    const copy = { built: isNaN(built) ? 0 : built.getTime(), episodes: episodes, repeats: repeats };
+    if (!best || (best.repeats.length && !repeats.length) || (!best.repeats.length === !repeats.length && copy.built > best.built)) best = copy;
+    if (attempt >= 3 && !best.repeats.length) break;
+  }
+  if (!best) throw new Error('The RSS feed could not be loaded');
+  return best;
+}
+
 async function main() {
-  const res = await fetch(RSS_URL);
-  if (!res.ok) throw new Error('The RSS feed answered ' + res.status);
-  const xml = await res.text();
-  const episodes = (xml.match(/<item>[\s\S]*?<\/item>/g) || []).map(episode);
+  const feed = await fetchFeed();
+  const episodes = feed.episodes;
 
   // A broken or half-loaded feed must never replace good data.
   if (!episodes.length) throw new Error('No episodes found in the RSS feed');
@@ -200,4 +238,15 @@ async function main() {
   console.log('episodes.json: ' + episodes.length + ' episodes' + (old ? ' (was ' + old.episodes.length + ')' : ''));
 }
 
-main().catch(function (err) { console.error(err.message); process.exit(1); });
+// Saved data with two episodes sharing a number still goes up, so a new episode is never held back, but the run is
+// marked with a warning on GitHub, since it usually means the feed was caught half-updated: run it again in a few minutes.
+function warnAboutRepeats() {
+  let saved;
+  try { saved = JSON.parse(fs.readFileSync(OUT, 'utf8')); } catch (err) { return; }
+  const repeats = duplicateNumbers(saved.episodes);
+  if (!repeats.length) return;
+  const message = 'Two episodes share the number ' + repeats.join(', ') + '. The RSS feed was probably caught partway through an edit; run this again in a few minutes. If it keeps happening, check the episode numbers in Spotify.';
+  console.log(process.env.GITHUB_ACTIONS ? '::warning::' + message : 'Warning: ' + message);
+}
+
+main().then(warnAboutRepeats).catch(function (err) { console.error(err.message); process.exit(1); });
